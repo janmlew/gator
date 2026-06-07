@@ -138,3 +138,51 @@ func handlerAgg(s *state, cmd command) error {
 	fmt.Printf("%+v\n", *feed)
 	return nil
 }
+
+// handlerAddFeed creates a new feed owned by the currently logged-in user.
+// Usage: gator addfeed <name> <url>
+func handlerAddFeed(s *state, cmd command) error {
+	if len(cmd.args) < 2 {
+		return errors.New("addfeed requires two arguments: name and url")
+	}
+
+	name := cmd.args[0]
+	url := cmd.args[1]
+
+	user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
+	if err != nil {
+		return fmt.Errorf("couldn't get current user: %w", err)
+	}
+
+	feed, err := s.db.CreateFeed(context.Background(), database.CreateFeedParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		Name:      name,
+		Url:       url,
+		UserID:    user.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't create feed: %w", err)
+	}
+
+	fmt.Printf("%+v\n", feed)
+	return nil
+}
+
+// handlerFeeds prints every feed in the database along with the user who added
+// it.
+// Usage: gator feeds
+func handlerFeeds(s *state, cmd command) error {
+	feeds, err := s.db.GetFeeds(context.Background())
+	if err != nil {
+		return fmt.Errorf("couldn't list feeds: %w", err)
+	}
+
+	for _, feed := range feeds {
+		fmt.Printf("* %s\n", feed.Name)
+		fmt.Printf("  url:   %s\n", feed.Url)
+		fmt.Printf("  added by: %s\n", feed.UserName)
+	}
+	return nil
+}
