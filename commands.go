@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -12,11 +13,13 @@ import (
 	"github.com/janmlew/gator/internal/database"
 )
 
-// state holds the application state shared across command handlers: the
-// database query layer and the config.
+// state holds the application state shared across command handlers: the raw
+// database connection (for transactions), the generated query layer, and the
+// config.
 type state struct {
-	db  *database.Queries
-	cfg *config.Config
+	conn *sql.DB
+	db   *database.Queries
+	cfg  *config.Config
 }
 
 // command represents a parsed CLI command: its name and its arguments.
@@ -149,12 +152,25 @@ func handlerAddFeed(s *state, cmd command) error {
 	name := cmd.args[0]
 	url := cmd.args[1]
 
-	user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
+	ctx := context.Background()
+
+	user, err := s.db.GetUser(ctx, s.cfg.CurrentUserName)
 	if err != nil {
 		return fmt.Errorf("couldn't get current user: %w", err)
 	}
 
-	feed, err := s.db.CreateFeed(context.Background(), database.CreateFeedParams{
+	// Creating the feed and the user's follow of it must happen atomically:
+	// either both succeed or neither does, so we never leave a feed without
+	// its creator's follow record.
+	tx, err := s.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("couldn't begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	qtx := s.db.WithTx(tx)
+
+	feed, err := qtx.CreateFeed(ctx, database.CreateFeedParams{
 		ID:        uuid.New(),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
@@ -166,7 +182,76 @@ func handlerAddFeed(s *state, cmd command) error {
 		return fmt.Errorf("couldn't create feed: %w", err)
 	}
 
+	// Adding a feed automatically follows it for the current user.
+	if _, err := qtx.CreateFeedFollow(ctx, database.CreateFeedFollowParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		UserID:    user.ID,
+		FeedID:    feed.ID,
+	}); err != nil {
+		return fmt.Errorf("couldn't follow new feed: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("couldn't commit transaction: %w", err)
+	}
+
 	fmt.Printf("%+v\n", feed)
+	return nil
+}
+
+// handlerFollow creates a feed-follow record linking the current user to an
+// existing feed (looked up by URL).
+// Usage: gator follow <url>
+func handlerFollow(s *state, cmd command) error {
+	if len(cmd.args) == 0 {
+		return errors.New("follow requires a single argument: the feed url")
+	}
+	url := cmd.args[0]
+
+	user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
+	if err != nil {
+		return fmt.Errorf("couldn't get current user: %w", err)
+	}
+
+	feed, err := s.db.GetFeedByURL(context.Background(), url)
+	if err != nil {
+		return fmt.Errorf("couldn't find feed with url %q: %w", url, err)
+	}
+
+	follow, err := s.db.CreateFeedFollow(context.Background(), database.CreateFeedFollowParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		UserID:    user.ID,
+		FeedID:    feed.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't create feed follow: %w", err)
+	}
+
+	fmt.Printf("%s is now following %s\n", follow.UserName, follow.FeedName)
+	return nil
+}
+
+// handlerFollowing prints the names of all feeds the current user follows.
+// Usage: gator following
+func handlerFollowing(s *state, cmd command) error {
+	user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
+	if err != nil {
+		return fmt.Errorf("couldn't get current user: %w", err)
+	}
+
+	follows, err := s.db.GetFeedFollowsForUser(context.Background(), user.ID)
+	if err != nil {
+		return fmt.Errorf("couldn't get feed follows: %w", err)
+	}
+
+	fmt.Printf("%s is following:\n", s.cfg.CurrentUserName)
+	for _, follow := range follows {
+		fmt.Printf("* %s\n", follow.FeedName)
+	}
 	return nil
 }
 

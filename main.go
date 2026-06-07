@@ -25,8 +25,9 @@ func main() {
 	dbQueries := database.New(db)
 
 	s := &state{
-		db:  dbQueries,
-		cfg: &cfg,
+		conn: db,
+		db:   dbQueries,
+		cfg:  &cfg,
 	}
 
 	cmds := &commands{
@@ -39,6 +40,8 @@ func main() {
 	cmds.register("agg", handlerAgg)
 	cmds.register("addfeed", handlerAddFeed)
 	cmds.register("feeds", handlerFeeds)
+	cmds.register("follow", handlerFollow)
+	cmds.register("following", handlerFollowing)
 
 	if len(os.Args) < 2 {
 		log.Fatal("usage: gator <command> [args...]")
