@@ -104,3 +104,37 @@ func handlerReset(s *state, cmd command) error {
 	fmt.Println("database reset successfully: all users deleted")
 	return nil
 }
+
+// handlerUsers prints all registered users, marking the currently logged-in
+// user with "(current)".
+// Usage: gator users
+func handlerUsers(s *state, cmd command) error {
+	users, err := s.db.GetUsers(context.Background())
+	if err != nil {
+		return fmt.Errorf("couldn't list users: %w", err)
+	}
+
+	for _, user := range users {
+		line := "* " + user.Name
+		if user.Name == s.cfg.CurrentUserName {
+			line += " (current)"
+		}
+		fmt.Println(line)
+	}
+	return nil
+}
+
+// handlerAgg fetches a single RSS feed and prints it. Placeholder for the
+// future long-running aggregator service.
+// Usage: gator agg
+func handlerAgg(s *state, cmd command) error {
+	const feedURL = "https://www.wagslane.dev/index.xml"
+
+	feed, err := fetchFeed(context.Background(), feedURL)
+	if err != nil {
+		return fmt.Errorf("couldn't fetch feed %q: %w", feedURL, err)
+	}
+
+	fmt.Printf("%+v\n", *feed)
+	return nil
+}
