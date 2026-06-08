@@ -6,12 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/janmlew/gator/internal/config"
 	"github.com/janmlew/gator/internal/database"
+	"github.com/lib/pq"
 )
+
+// pgUniqueViolation is the Postgres SQLSTATE error code for a unique constraint
+// violation. We use it to detect "this post URL already exists" during scraping.
+const pgUniqueViolation = "23505"
 
 // state holds the application state shared across command handlers: the raw
 // database connection (for transactions), the generated query layer, and the
@@ -141,19 +148,101 @@ func handlerUsers(s *state, cmd command) error {
 	return nil
 }
 
-// handlerAgg fetches a single RSS feed and prints it. Placeholder for the
-// future long-running aggregator service.
-// Usage: gator agg
+// handlerAgg continuously scrapes feeds, one per tick, waiting the given
+// duration between requests. It runs until interrupted.
+// Usage: gator agg <time_between_reqs>  (e.g. gator agg 1m)
 func handlerAgg(s *state, cmd command) error {
-	const feedURL = "https://www.wagslane.dev/index.xml"
-
-	feed, err := fetchFeed(context.Background(), feedURL)
-	if err != nil {
-		return fmt.Errorf("couldn't fetch feed %q: %w", feedURL, err)
+	if len(cmd.args) == 0 {
+		return errors.New("agg requires a single argument: the time between requests (e.g. 1m, 30s)")
 	}
 
-	fmt.Printf("%+v\n", *feed)
+	timeBetweenReqs, err := time.ParseDuration(cmd.args[0])
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", cmd.args[0], err)
+	}
+
+	fmt.Printf("Collecting feeds every %s\n", timeBetweenReqs)
+
+	// Tick immediately on entry, then once per interval. Errors are logged
+	// rather than fatal so a single bad feed doesn't stop the aggregator.
+	ticker := time.NewTicker(timeBetweenReqs)
+	defer ticker.Stop()
+	for ; ; <-ticker.C {
+		if err := scrapeFeeds(s); err != nil {
+			log.Printf("error scraping feeds: %v", err)
+		}
+	}
+}
+
+// scrapeFeeds fetches and prints the single oldest-fetched feed, marking it
+// fetched first so the next call moves on to a different feed.
+func scrapeFeeds(s *state) error {
+	ctx := context.Background()
+
+	feed, err := s.db.GetNextFeedToFetch(ctx)
+	if err != nil {
+		return fmt.Errorf("couldn't get next feed to fetch: %w", err)
+	}
+
+	if err := s.db.MarkFeedFetched(ctx, feed.ID); err != nil {
+		return fmt.Errorf("couldn't mark feed %q fetched: %w", feed.Name, err)
+	}
+
+	rssFeed, err := fetchFeed(ctx, feed.Url)
+	if err != nil {
+		return fmt.Errorf("couldn't fetch feed %q: %w", feed.Name, err)
+	}
+
+	for _, item := range rssFeed.Channel.Item {
+		_, err := s.db.CreatePost(ctx, database.CreatePostParams{
+			ID:          uuid.New(),
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+			Title:       item.Title,
+			Url:         item.Link,
+			Description: sql.NullString{String: item.Description, Valid: item.Description != ""},
+			PublishedAt: parsePublishedAt(item.PubDate),
+			FeedID:      feed.ID,
+		})
+		if err != nil {
+			// A post with this URL already exists — expected on every
+			// re-scrape — so silently skip it. Anything else is worth logging.
+			var pqErr *pq.Error
+			if errors.As(err, &pqErr) && string(pqErr.Code) == pgUniqueViolation {
+				continue
+			}
+			log.Printf("couldn't save post %q: %v", item.Link, err)
+		}
+	}
+
+	log.Printf("Feed %q collected, %d posts processed", feed.Name, len(rssFeed.Channel.Item))
 	return nil
+}
+
+// parsePublishedAt tries a series of common RSS/Atom date layouts and returns a
+// sql.NullTime. If the string is empty or matches no known layout, it returns
+// an invalid (NULL) time rather than failing the whole post.
+func parsePublishedAt(s string) sql.NullTime {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return sql.NullTime{}
+	}
+
+	layouts := []string{
+		time.RFC1123Z, // Mon, 02 Jan 2006 15:04:05 -0700
+		time.RFC1123,  // Mon, 02 Jan 2006 15:04:05 MST
+		time.RFC822Z,  // 02 Jan 06 15:04 -0700
+		time.RFC822,   // 02 Jan 06 15:04 MST
+		time.RFC3339,  // 2006-01-02T15:04:05Z07:00
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return sql.NullTime{Time: t, Valid: true}
+		}
+	}
+	return sql.NullTime{}
 }
 
 // handlerAddFeed creates a new feed owned by the currently logged-in user.
@@ -276,6 +365,42 @@ func handlerUnfollow(s *state, cmd command, user database.User) error {
 	}
 
 	fmt.Printf("%s unfollowed %s\n", user.Name, feed.Name)
+	return nil
+}
+
+// handlerBrowse prints the most recent posts from the feeds the current user
+// follows. The optional argument sets how many to show (defaults to 2).
+// Usage: gator browse [limit]
+func handlerBrowse(s *state, cmd command, user database.User) error {
+	limit := 2
+	if len(cmd.args) > 0 {
+		n, err := strconv.Atoi(cmd.args[0])
+		if err != nil {
+			return fmt.Errorf("invalid limit %q: %w", cmd.args[0], err)
+		}
+		limit = n
+	}
+
+	posts, err := s.db.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
+		UserID: user.ID,
+		Limit:  int32(limit),
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't get posts: %w", err)
+	}
+
+	fmt.Printf("Found %d posts for %s:\n", len(posts), user.Name)
+	for _, post := range posts {
+		published := "unknown date"
+		if post.PublishedAt.Valid {
+			published = post.PublishedAt.Time.Format(time.RFC1123)
+		}
+		fmt.Printf("\n%s (%s)\n", post.Title, published)
+		fmt.Printf("  %s\n", post.Url)
+		if post.Description.Valid {
+			fmt.Printf("  %s\n", post.Description.String)
+		}
+	}
 	return nil
 }
 
