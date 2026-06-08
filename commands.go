@@ -48,6 +48,20 @@ func (c *commands) run(s *state, cmd command) error {
 	return handler(s, cmd)
 }
 
+// middlewareLoggedIn wraps a handler that requires an authenticated user. It
+// looks up the current user once, and either passes it into the handler or
+// fails before the handler runs. This keeps the "who's logged in?" lookup in a
+// single place.
+func middlewareLoggedIn(handler func(s *state, cmd command, user database.User) error) func(*state, command) error {
+	return func(s *state, cmd command) error {
+		user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
+		if err != nil {
+			return fmt.Errorf("couldn't get current user: %w", err)
+		}
+		return handler(s, cmd, user)
+	}
+}
+
 // handlerLogin sets the current user in the config file.
 // Usage: gator login <username>
 func handlerLogin(s *state, cmd command) error {
@@ -144,7 +158,7 @@ func handlerAgg(s *state, cmd command) error {
 
 // handlerAddFeed creates a new feed owned by the currently logged-in user.
 // Usage: gator addfeed <name> <url>
-func handlerAddFeed(s *state, cmd command) error {
+func handlerAddFeed(s *state, cmd command, user database.User) error {
 	if len(cmd.args) < 2 {
 		return errors.New("addfeed requires two arguments: name and url")
 	}
@@ -153,11 +167,6 @@ func handlerAddFeed(s *state, cmd command) error {
 	url := cmd.args[1]
 
 	ctx := context.Background()
-
-	user, err := s.db.GetUser(ctx, s.cfg.CurrentUserName)
-	if err != nil {
-		return fmt.Errorf("couldn't get current user: %w", err)
-	}
 
 	// Creating the feed and the user's follow of it must happen atomically:
 	// either both succeed or neither does, so we never leave a feed without
@@ -204,16 +213,11 @@ func handlerAddFeed(s *state, cmd command) error {
 // handlerFollow creates a feed-follow record linking the current user to an
 // existing feed (looked up by URL).
 // Usage: gator follow <url>
-func handlerFollow(s *state, cmd command) error {
+func handlerFollow(s *state, cmd command, user database.User) error {
 	if len(cmd.args) == 0 {
 		return errors.New("follow requires a single argument: the feed url")
 	}
 	url := cmd.args[0]
-
-	user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
-	if err != nil {
-		return fmt.Errorf("couldn't get current user: %w", err)
-	}
 
 	feed, err := s.db.GetFeedByURL(context.Background(), url)
 	if err != nil {
@@ -237,18 +241,13 @@ func handlerFollow(s *state, cmd command) error {
 
 // handlerFollowing prints the names of all feeds the current user follows.
 // Usage: gator following
-func handlerFollowing(s *state, cmd command) error {
-	user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
-	if err != nil {
-		return fmt.Errorf("couldn't get current user: %w", err)
-	}
-
+func handlerFollowing(s *state, cmd command, user database.User) error {
 	follows, err := s.db.GetFeedFollowsForUser(context.Background(), user.ID)
 	if err != nil {
 		return fmt.Errorf("couldn't get feed follows: %w", err)
 	}
 
-	fmt.Printf("%s is following:\n", s.cfg.CurrentUserName)
+	fmt.Printf("%s is following:\n", user.Name)
 	for _, follow := range follows {
 		fmt.Printf("* %s\n", follow.FeedName)
 	}
